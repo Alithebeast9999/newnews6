@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import random
@@ -19,12 +20,14 @@ log = logging.getLogger("bot")
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = os.environ["TARGET_CHAT_ID"]          # id или @username вашей группы/канала
 DATABASE_URL = os.environ["DATABASE_URL"]
-LLM_API_KEY = os.environ["LLM_API_KEY"]         # ключ Google AI Studio (Gemini)
-PEXELS_KEY = os.environ["PEXELS_KEY"]
+LLM_API_KEY = os.environ["LLM_API_KEY"]         # ключ любого провайдера с OpenAI-совместимым API
+LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/")
+IMAGE_PROVIDER = os.environ.get("IMAGE_PROVIDER", "pixabay")  # pixabay | unsplash | none
+IMAGE_KEY = os.environ.get("IMAGE_KEY", "")
 TICK_SECRET = os.environ["TICK_SECRET"]         # любая длинная случайная строка
 SOURCES = [s.strip().lstrip("@") for s in os.environ["SOURCES"].split(",") if s.strip()]
 
-LLM_MODEL = os.environ.get("LLM_MODEL", "gemini-2.5-flash")
+LLM_MODEL = os.environ.get("LLM_MODEL", "openai/gpt-oss-120b")
 TZ_NAME = os.environ.get("TZ_NAME", "Europe/Moscow")
 COLLECT_HOUR = int(os.environ.get("COLLECT_HOUR", "6"))
 POSTS_PER_DAY = int(os.environ.get("POSTS_PER_DAY", "4"))
@@ -114,32 +117,43 @@ PROMPT = (
 
 def rewrite(text):
     r = httpx.post(
-        f"https://generativelanguage.googleapis.com/v1beta/models/{LLM_MODEL}:generateContent",
-        headers={"x-goog-api-key": LLM_API_KEY},
+        f"{LLM_BASE_URL}/chat/completions",
+        headers={"Authorization": f"Bearer {LLM_API_KEY}"},
         json={
-            "contents": [{"parts": [{"text": PROMPT + text[:3000]}]}],
-            "generationConfig": {"responseMimeType": "application/json"},
+            "model": LLM_MODEL,
+            "messages": [{"role": "user", "content": PROMPT + text[:3000]}],
+            "temperature": 0.7,
         },
-        timeout=60,
+        timeout=90,
     )
     r.raise_for_status()
-    import json
-
-    return json.loads(r.json()["candidates"][0]["content"]["parts"][0]["text"])
+    content = r.json()["choices"][0]["message"]["content"] or ""
+    m = re.search(r"\{.*\}", content, re.S)
+    return json.loads(m.group(0))
 
 
 def find_image(query):
-    if not query.strip():
+    if not query.strip() or IMAGE_PROVIDER == "none":
         return None
-    r = httpx.get(
-        "https://api.pexels.com/v1/search",
-        headers={"Authorization": PEXELS_KEY},
-        params={"query": query, "per_page": 8, "orientation": "landscape"},
-        timeout=20,
-    )
-    r.raise_for_status()
-    photos = r.json().get("photos", [])
-    return random.choice(photos)["src"]["large"] if photos else None
+    if IMAGE_PROVIDER == "unsplash":
+        r = httpx.get(
+            "https://api.unsplash.com/search/photos",
+            headers={"Authorization": f"Client-ID {IMAGE_KEY}"},
+            params={"query": query, "per_page": 10, "orientation": "landscape"},
+            timeout=20,
+        )
+        r.raise_for_status()
+        urls = [p["urls"]["regular"] for p in r.json().get("results", [])]
+    else:  # pixabay
+        r = httpx.get(
+            "https://pixabay.com/api/",
+            params={"key": IMAGE_KEY, "q": query, "image_type": "photo",
+                    "orientation": "horizontal", "safesearch": "true", "per_page": 10},
+            timeout=20,
+        )
+        r.raise_for_status()
+        urls = [h["largeImageURL"] for h in r.json().get("hits", [])]
+    return random.choice(urls) if urls else None
 
 
 def schedule_time(i, now, force):
@@ -192,16 +206,19 @@ def collect(force=False):
 
 
 # ---------- публикация ----------
-def tg(method, **data):
-    r = httpx.post(f"https://api.telegram.org/bot{BOT_TOKEN}/{method}", data=data, timeout=30)
+def tg(method, files=None, **data):
+    r = httpx.post(f"https://api.telegram.org/bot{BOT_TOKEN}/{method}", data=data, files=files, timeout=60)
     r.raise_for_status()
 
 
 def send(text, image):
     if image:
         try:
+            pic = httpx.get(image, headers=UA, timeout=30, follow_redirects=True)
+            pic.raise_for_status()
             short = len(text) <= 1024
-            tg("sendPhoto", chat_id=CHAT_ID, photo=image, **({"caption": text} if short else {}))
+            tg("sendPhoto", files={"photo": ("photo.jpg", pic.content)}, chat_id=CHAT_ID,
+               **({"caption": text} if short else {}))
             if short:
                 return
         except httpx.HTTPError as e:
